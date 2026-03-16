@@ -1,0 +1,142 @@
+##############################################################
+# PulseEngine · Docker Compose Orchestration
+# Spins up: Redis, TimescaleDB, Ingestor, Processor, Dashboard
+##############################################################
+
+services:
+
+  # ─── Redis (Streams-enabled) ─────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: pulse-redis
+    ports:
+      - "6379:6379"
+    command: >
+      redis-server
+        --appendonly yes
+        --maxmemory 512mb
+        --maxmemory-policy noeviction
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - pulse-net
+
+  # ─── TimescaleDB (PostgreSQL + Time-Series) ──────────────
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    container_name: pulse-timescaledb
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./infrastructure/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - pulse-net
+
+  # ─── Ingestion Service (Node.js + TypeScript) ────────────
+  ingestor:
+    build:
+      context: ./ingestion-service
+      dockerfile: Dockerfile
+    container_name: pulse-ingestor
+    ports:
+      - "${INGESTOR_WS_PORT}:${INGESTOR_WS_PORT}"
+    environment:
+      REDIS_HOST: ${REDIS_HOST}
+      REDIS_PORT: ${REDIS_PORT}
+      REDIS_STREAM_KEY: ${REDIS_STREAM_KEY}
+      WS_PORT: ${INGESTOR_WS_PORT}
+      MAX_CONNECTIONS: ${INGESTOR_MAX_CONNECTIONS}
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - pulse-net
+
+  # ─── Processing Service (.NET Core 8 + SignalR Hub) ──────
+  processor:
+    build:
+      context: ./processing-service
+      dockerfile: Dockerfile
+    container_name: pulse-processor
+    ports:
+      - "5050:5050"
+    environment:
+      REDIS_HOST: ${REDIS_HOST}
+      REDIS_PORT: ${REDIS_PORT}
+      REDIS_STREAM_KEY: ${REDIS_STREAM_KEY}
+      CONSUMER_GROUP: ${PROCESSOR_CONSUMER_GROUP}
+      CONSUMER_NAME: ${PROCESSOR_CONSUMER_NAME}
+      BATCH_SIZE: ${PROCESSOR_BATCH_SIZE}
+      BLOCK_MS: ${PROCESSOR_BLOCK_MS}
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      ALERT_TEMPERATURE_HIGH: ${ALERT_TEMPERATURE_HIGH}
+      ALERT_TEMPERATURE_LOW: ${ALERT_TEMPERATURE_LOW}
+      ALERT_PRESSURE_HIGH: ${ALERT_PRESSURE_HIGH}
+      ALERT_HUMIDITY_HIGH: ${ALERT_HUMIDITY_HIGH}
+    depends_on:
+      redis:
+        condition: service_healthy
+      timescaledb:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - pulse-net
+
+  # ─── Dashboard (React + Vite → Nginx) ───────────────────
+  dashboard:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: pulse-dashboard
+    ports:
+      - "3000:80"
+    depends_on:
+      - processor
+    restart: unless-stopped
+    networks:
+      - pulse-net
+
+  # ─── Sensor Simulator (Data Generator) ──────────────────
+  simulator:
+    build:
+      context: ./simulator
+      dockerfile: Dockerfile
+    container_name: pulse-simulator
+    environment:
+      WS_URL: ws://ingestor:${INGESTOR_WS_PORT}
+      SENSORS_COUNT: 8
+      INTERVAL_MS: 25
+      BURST_SIZE: 25
+    depends_on:
+      - ingestor
+    restart: unless-stopped
+    networks:
+      - pulse-net
+
+volumes:
+  redis_data:
+  pg_data:
+
+networks:
+  pulse-net:
+    driver: bridge
