@@ -40,6 +40,7 @@
 - [Configuration Reference](#configuration-reference)
 - [Getting Started](#getting-started)
 - [Testing the Pipeline](#testing-the-pipeline)
+- [Documentation](#documentation)
 
 ---
 
@@ -972,6 +973,22 @@ SELECT * FROM telemetry_1m ORDER BY bucket DESC LIMIT 5;
 -- Compression stats
 SELECT * FROM hypertable_compression_stats('telemetry');
 ```
+
+---
+
+## Documentation
+
+For detailed documentation beyond this README, see the [`docs/`](./docs/) directory:
+
+| Document | Description |
+|----------|-------------|
+| [Architecture & Design](./docs/architecture.md) | System architecture, design decisions, data flow, and technology rationale |
+| [API Reference](./docs/api-reference.md) | WebSocket, SignalR, and HTTP endpoint specifications with usage examples |
+| [Deployment Guide](./docs/deployment-guide.md) | Docker Compose setup, configuration, scaling, and production considerations |
+| [Development Guide](./docs/development-guide.md) | Local development setup, project structure, coding conventions |
+| [Database Schema](./docs/database-schema.md) | TimescaleDB schema, hypertable config, indexes, policies, and common queries |
+| [Monitoring & Observability](./docs/monitoring-guide.md) | Prometheus metrics, Grafana dashboards, alerting rules, and PromQL reference |
+| [Troubleshooting](./docs/troubleshooting.md) | Common issues, debugging commands, and resolution guides |
 
 ---
 
