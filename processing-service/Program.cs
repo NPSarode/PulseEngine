@@ -1,4 +1,5 @@
 using Microsoft.AspNetCore.SignalR;
+using Prometheus;
 using StackExchange.Redis;
 using PulseEngine.Processor.Hubs;
 using PulseEngine.Processor.Services;
@@ -20,7 +21,7 @@ var pgUser = Environment.GetEnvironmentVariable("POSTGRES_USER") ?? "pulse_admin
 var pgPass = Environment.GetEnvironmentVariable("POSTGRES_PASSWORD") ?? "";
 
 Console.WriteLine("═══════════════════════════════════════════");
-Console.WriteLine("  PulseEngine · Processing Service v1.0.0 ");
+Console.WriteLine("  PulseEngine · Processing Service v1.1.0 ");
 Console.WriteLine("═══════════════════════════════════════════");
 
 // ─── Build Web App ───────────────────────────────────────
@@ -52,12 +53,17 @@ await dbService.InitializeAsync();
 // Threshold alert evaluator
 var alertService = new ThresholdAlertService();
 
+// Dead Letter Queue service
+builder.Services.AddSingleton<DeadLetterService>(sp =>
+    new DeadLetterService(redis, sp.GetRequiredService<ILogger<DeadLetterService>>()));
+
 // Register the consumer worker
 builder.Services.AddHostedService(sp =>
     new TelemetryConsumerWorker(
         sp.GetRequiredService<ILogger<TelemetryConsumerWorker>>(),
         dbService,
         alertService,
+        sp.GetRequiredService<DeadLetterService>(),
         redis,
         sp.GetRequiredService<IHubContext<TelemetryHub>>(),
         streamKey,
@@ -71,10 +77,16 @@ builder.Services.AddHostedService(sp =>
 var app = builder.Build();
 
 app.UseCors();
+
+// Prometheus metrics
+app.UseHttpMetrics();
+app.MapMetrics();
+
 app.MapHub<TelemetryHub>("/hub/telemetry");
 
 // Kestrel listens on port 5050
 app.Urls.Add("http://0.0.0.0:5050");
 
 Console.WriteLine("[SignalR] Hub mapped at /hub/telemetry on port 5050");
+Console.WriteLine("[Prometheus] Metrics endpoint at /metrics on port 5050");
 await app.RunAsync();

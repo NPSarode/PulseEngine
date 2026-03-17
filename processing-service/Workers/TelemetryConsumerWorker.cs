@@ -1,4 +1,5 @@
 using Microsoft.AspNetCore.SignalR;
+using Prometheus;
 using StackExchange.Redis;
 using PulseEngine.Processor.Hubs;
 using PulseEngine.Processor.Models;
@@ -16,6 +17,7 @@ public sealed class TelemetryConsumerWorker : BackgroundService
     private readonly ILogger<TelemetryConsumerWorker> _logger;
     private readonly TimescaleDbService _db;
     private readonly ThresholdAlertService _alertService;
+    private readonly DeadLetterService _dlq;
     private readonly ConnectionMultiplexer _redis;
     private readonly IHubContext<TelemetryHub> _hub;
     private readonly string _streamKey;
@@ -24,10 +26,52 @@ public sealed class TelemetryConsumerWorker : BackgroundService
     private readonly int _batchSize;
     private readonly int _blockMs;
 
+    // ── Prometheus Metrics ─────────────────────────────────
+    private static readonly Counter EventsProcessedTotal = Metrics
+        .CreateCounter("pulse_events_processed_total",
+            "Total telemetry events successfully processed");
+
+    private static readonly Histogram BatchSizeHistogram = Metrics
+        .CreateHistogram("pulse_batch_size",
+            "Number of events per processing batch",
+            new HistogramConfiguration
+            {
+                Buckets = Histogram.LinearBuckets(start: 10, width: 10, count: 10)
+            });
+
+    private static readonly Histogram ProcessingDuration = Metrics
+        .CreateHistogram("pulse_processing_duration_seconds",
+            "Time to process a complete batch (parse + evaluate + persist + broadcast)",
+            new HistogramConfiguration
+            {
+                Buckets = Histogram.ExponentialBuckets(start: 0.001, factor: 2, count: 12)
+            });
+
+    private static readonly Counter AlertsGeneratedTotal = Metrics
+        .CreateCounter("pulse_alerts_generated_total",
+            "Total threshold alerts generated");
+
+    private static readonly Histogram DbWriteDuration = Metrics
+        .CreateHistogram("pulse_db_write_duration_seconds",
+            "Time to persist a batch to TimescaleDB via COPY",
+            new HistogramConfiguration
+            {
+                Buckets = Histogram.ExponentialBuckets(start: 0.001, factor: 2, count: 10)
+            });
+
+    private static readonly Counter DlqMessagesTotal = Metrics
+        .CreateCounter("pulse_dlq_messages_total",
+            "Total messages sent to the dead letter queue");
+
+    private static readonly Gauge DlqLength = Metrics
+        .CreateGauge("pulse_dlq_length",
+            "Current length of the dead letter queue in Redis");
+
     public TelemetryConsumerWorker(
         ILogger<TelemetryConsumerWorker> logger,
         TimescaleDbService db,
         ThresholdAlertService alertService,
+        DeadLetterService dlq,
         ConnectionMultiplexer redis,
         IHubContext<TelemetryHub> hub,
         string streamKey,
@@ -39,6 +83,7 @@ public sealed class TelemetryConsumerWorker : BackgroundService
         _logger = logger;
         _db = db;
         _alertService = alertService;
+        _dlq = dlq;
         _redis = redis;
         _hub = hub;
         _streamKey = streamKey;
@@ -90,18 +135,29 @@ public sealed class TelemetryConsumerWorker : BackgroundService
 
                 // ── Parse stream entries into domain models ──
                 var events = new List<TelemetryEvent>(entries.Length);
+                var entryFieldsMap = new Dictionary<string, Dictionary<string, string>>();
+
                 foreach (var entry in entries)
                 {
                     var fields = entry.Values.ToDictionary(
                         v => v.Name.ToString(),
                         v => v.Value.ToString());
 
+                    entryFieldsMap[entry.Id.ToString()] = fields;
+
                     if (!fields.TryGetValue("sensorId", out var sensorId) ||
                         !fields.TryGetValue("metricType", out var metricType) ||
                         !fields.TryGetValue("value", out var valueStr) ||
                         !double.TryParse(valueStr, out var value))
                     {
-                        _logger.LogWarning("Skipping malformed entry {Id}", entry.Id);
+                        // ── DLQ: malformed entry ───────────────────
+                        var reason = !fields.ContainsKey("sensorId") ? "Missing sensorId"
+                            : !fields.ContainsKey("metricType") ? "Missing metricType"
+                            : !fields.ContainsKey("value") ? "Missing value"
+                            : $"Unparseable value: '{fields.GetValueOrDefault("value")}'";
+
+                        await _dlq.PushAsync(entry.Id.ToString(), fields, reason);
+                        DlqMessagesTotal.Inc();
                         continue;
                     }
 
@@ -122,52 +178,71 @@ public sealed class TelemetryConsumerWorker : BackgroundService
                     });
                 }
 
-                // ── Threshold evaluation ─────────────────────
-                var alerts = _alertService.Evaluate(events);
-                if (alerts.Count > 0)
+                if (events.Count == 0)
                 {
-                    _logger.LogWarning("{Count} threshold alerts triggered", alerts.Count);
+                    // All entries were malformed — ACK and move on
+                    foreach (var entry in entries)
+                        await db.StreamAcknowledgeAsync(_streamKey, _groupName, entry.Id);
+                    continue;
                 }
 
-                // ── Persist to TimescaleDB ───────────────────
-                await _db.InsertTelemetryBatchAsync(events);
+                BatchSizeHistogram.Observe(events.Count);
 
-                if (alerts.Count > 0)
+                // ── Process batch (with Prometheus timing) ─────
+                using (ProcessingDuration.NewTimer())
                 {
-                    await _db.InsertAlertsAsync(alerts);
-                }
-
-                // ── Push to SignalR (real-time dashboard) ────
-                await _hub.Clients.All.SendAsync(
-                    "ReceiveTelemetryBatch",
-                    events.Select(e => new
+                    // ── Threshold evaluation ─────────────────────
+                    var alerts = _alertService.Evaluate(events);
+                    if (alerts.Count > 0)
                     {
-                        e.SensorId,
-                        e.MetricType,
-                        e.Value,
-                        e.Unit,
-                        Timestamp = e.Timestamp.ToString("o")
-                    }),
-                    stoppingToken
-                );
+                        _logger.LogWarning("{Count} threshold alerts triggered", alerts.Count);
+                        AlertsGeneratedTotal.Inc(alerts.Count);
+                    }
 
-                foreach (var alert in alerts)
-                {
+                    // ── Persist to TimescaleDB ───────────────────
+                    using (DbWriteDuration.NewTimer())
+                    {
+                        await _db.InsertTelemetryBatchAsync(events);
+                        if (alerts.Count > 0)
+                            await _db.InsertAlertsAsync(alerts);
+                    }
+
+                    // ── Push to SignalR (real-time dashboard) ────
                     await _hub.Clients.All.SendAsync(
-                        "ReceiveAlert",
-                        new
+                        "ReceiveTelemetryBatch",
+                        events.Select(e => new
                         {
-                            Id = Guid.NewGuid().ToString(),
-                            alert.SensorId,
-                            alert.MetricType,
-                            alert.ThresholdValue,
-                            alert.ActualValue,
-                            alert.Severity,
-                            alert.Message,
-                            TriggeredAt = alert.TriggeredAt.ToString("o")
-                        },
+                            e.SensorId,
+                            e.MetricType,
+                            e.Value,
+                            e.Unit,
+                            Timestamp = e.Timestamp.ToString("o")
+                        }),
                         stoppingToken
                     );
+
+                    foreach (var alert in alerts)
+                    {
+                        await _hub.Clients.All.SendAsync(
+                            "ReceiveAlert",
+                            new
+                            {
+                                Id = Guid.NewGuid().ToString(),
+                                alert.SensorId,
+                                alert.MetricType,
+                                alert.ThresholdValue,
+                                alert.ActualValue,
+                                alert.Severity,
+                                alert.Message,
+                                TriggeredAt = alert.TriggeredAt.ToString("o")
+                            },
+                            stoppingToken
+                        );
+                    }
+
+                    _logger.LogInformation(
+                        "Processed {Events} events, {Alerts} alerts → pushed to SignalR",
+                        events.Count, alerts.Count);
                 }
 
                 // ── ACK all processed entries ────────────────
@@ -176,9 +251,10 @@ public sealed class TelemetryConsumerWorker : BackgroundService
                     await db.StreamAcknowledgeAsync(_streamKey, _groupName, entry.Id);
                 }
 
-                _logger.LogInformation(
-                    "Processed {Events} events, {Alerts} alerts → pushed to SignalR",
-                    events.Count, alerts.Count);
+                EventsProcessedTotal.Inc(events.Count);
+
+                // ── Update DLQ gauge ─────────────────────────
+                try { DlqLength.Set(await _dlq.GetLengthAsync()); } catch { /* non-critical */ }
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {

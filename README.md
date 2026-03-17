@@ -11,6 +11,8 @@
 [![React](https://img.shields.io/badge/React-18-61DAFB?logo=react&logoColor=black)](https://reactjs.org/)
 [![Redis](https://img.shields.io/badge/Redis_Streams-7-DC382D?logo=redis&logoColor=white)](https://redis.io/)
 [![TimescaleDB](https://img.shields.io/badge/TimescaleDB-PG16-FDB515?logo=timescale&logoColor=black)](https://www.timescale.com/)
+[![Prometheus](https://img.shields.io/badge/Prometheus-Metrics-E6522C?logo=prometheus&logoColor=white)](https://prometheus.io/)
+[![Grafana](https://img.shields.io/badge/Grafana-Dashboard-F46800?logo=grafana&logoColor=white)](https://grafana.com/)
 [![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white)](https://docs.docker.com/compose/)
 
 </div>
@@ -30,6 +32,8 @@
   - [Frontend Dashboard](#3-frontend-dashboard--react--d3js)
   - [Sensor Simulator](#4-sensor-simulator--nodejs)
   - [Infrastructure](#5-infrastructure--timescaledb)
+  - [Observability](#6-observability--prometheus--grafana)
+- [Dead Letter Queue](#dead-letter-queue)
 - [Telemetry Event Schema](#telemetry-event-schema)
 - [Performance Engineering](#performance-engineering)
 - [Problems Solved vs Naive Approaches](#problems-solved-vs-naive-approaches)
@@ -216,7 +220,7 @@ ThresholdAlert generated (severity: CRITICAL)
 ```
 PulseEngine/
 │
-├── docker-compose.yml              # Orchestrates all 6 services
+├── docker-compose.yml              # Orchestrates all 8 services
 ├── .env                            # Centralized environment configuration
 ├── README.md                       # You are here
 │
@@ -274,7 +278,16 @@ PulseEngine/
 │   └── package.json
 │
 └── infrastructure/
-    └── init-db.sql                 # TimescaleDB schema, hypertable, policies
+    ├── init-db.sql                 # TimescaleDB schema, hypertable, policies
+    ├── prometheus.yml              # Prometheus scrape configuration
+    └── grafana/
+        ├── provisioning/
+        │   ├── datasources/
+        │   │   └── datasource.yml  # Auto-configure Prometheus source
+        │   └── dashboards/
+        │       └── dashboard.yml   # File-based dashboard provider
+        └── dashboards/
+            └── pulse-health.json   # Pre-built PulseEngine Health dashboard
 ```
 
 ---
@@ -534,6 +547,117 @@ idx_alerts_unack            → (acknowledged, triggered_at DESC) WHERE NOT ackn
 
 ---
 
+### 6. Observability — Prometheus + Grafana
+
+**Purpose:** Monitor PulseEngine's own health — CPU, memory, event rates, latencies, error counts — via industry-standard Prometheus metrics and pre-built Grafana dashboards.
+
+#### Architecture
+
+```
+┌───────────────┐       ┌───────────────┐
+│   Ingestor    │:9100  │   Processor   │:5050
+│   /metrics    │◄──────│   /metrics    │◄──────┐
+└───────────────┘  scrape└───────────────┘       │
+        ▲                        ▲               │
+        │          ┌─────────────┘               │
+        └──────────┤  Prometheus  │:9090         │
+                   │  (15s scrape)│───────────────┘
+                   └──────┬──────┘
+                          │ PromQL
+                   ┌──────▼──────┐
+                   │   Grafana   │:3001
+                   │  (auto-     │
+                   │  provisioned│
+                   │  dashboard) │
+                   └─────────────┘
+```
+
+#### Processor Metrics (.NET)
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `pulse_events_processed_total` | Counter | Events successfully processed |
+| `pulse_batch_size` | Histogram | Events per processing batch |
+| `pulse_processing_duration_seconds` | Histogram | Full batch processing time |
+| `pulse_db_write_duration_seconds` | Histogram | TimescaleDB COPY duration |
+| `pulse_alerts_generated_total` | Counter | Threshold alerts created |
+| `pulse_signalr_connections` | Gauge | Active dashboard connections |
+| `pulse_dlq_messages_total` | Counter | Messages routed to DLQ |
+| `pulse_dlq_length` | Gauge | Current DLQ size |
+
+#### Ingestor Metrics (Node.js)
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `pulse_ws_connections_active` | Gauge | Active WebSocket connections |
+| `pulse_ws_messages_received_total` | Counter | Messages received from sensors |
+| `pulse_redis_pushes_total` | Counter | Events pushed to Redis |
+| `pulse_batch_flush_duration_seconds` | Histogram | Pipeline exec duration |
+| `pulse_ingestor_nodejs_heap_size_*` | Gauge | Node.js heap memory (auto-collected) |
+| `pulse_ingestor_nodejs_eventloop_lag_seconds` | Gauge | Event loop lag (auto-collected) |
+
+#### Grafana Dashboard
+
+Auto-provisioned at startup with 14 panels across two rows:
+
+- **Processor row:** Events rate, batch size histogram, processing duration P50/P95/P99, DB write P95, SignalR connections, alerts rate, DLQ count, DLQ queue length
+- **Ingestor row:** WebSocket connections, messages rate, Redis push rate, flush duration P95, heap memory, event loop lag
+
+Access at `http://localhost:3001` (login: `admin` / `pulse2026`).
+
+---
+
+## Dead Letter Queue
+
+**Purpose:** Corrupted or malformed telemetry data is captured instead of silently dropped, enabling debugging and replay.
+
+#### How It Works
+
+```
+Redis Stream entry arrives at Processor
+         │
+         ▼
+Parse sensorId, metricType, value
+         │
+    FAIL ▼ (missing field or unparseable value)
+DeadLetterService.PushAsync()
+         │
+         ▼
+LPUSH → telemetry_errors (Redis list)
+         │
+         ▼
+JSON payload stored:
+{
+  "StreamEntryId": "1710000000000-0",
+  "RawData": { "sensorId": "...", "value": "NaN" },
+  "ErrorReason": "Unparseable value: 'NaN'",
+  "Timestamp": "2026-03-17T...",
+  "Source": "TelemetryConsumerWorker"
+}
+```
+
+#### Design Decisions
+
+- **ACK after DLQ:** Malformed entries are ACK'd to prevent infinite re-delivery of bad data. The DLQ preserves the data for manual inspection.
+- **LPUSH ordering:** Most recent failures appear first (natural debugging order).
+- **No TTL:** DLQ entries persist until manually cleared — important for audit trails.
+- **Prometheus integration:** `pulse_dlq_messages_total` (counter) and `pulse_dlq_length` (gauge) are exposed for alerting in Grafana.
+
+#### Inspecting the DLQ
+
+```bash
+# View latest 10 DLQ entries
+docker exec pulse-redis redis-cli LRANGE telemetry_errors 0 9
+
+# Count total DLQ entries
+docker exec pulse-redis redis-cli LLEN telemetry_errors
+
+# Clear the DLQ after inspection
+docker exec pulse-redis redis-cli DEL telemetry_errors
+```
+
+---
+
 ## Telemetry Event Schema
 
 ### WebSocket Input (Sensor → Ingestor)
@@ -660,6 +784,8 @@ await using var writer = await conn.BeginBinaryImportAsync(
 | **Historical rollups** | Ad-hoc GROUP BY queries | Continuous aggregates (pre-computed) | Instant dashboard loads |
 | **Processor failure** | Lost in-flight events | Consumer group ACKs + re-delivery | At-least-once guarantee |
 | **Horizontal scaling** | Single monolith | Consumer group sharding (add instances) | Linear scale-out |
+| **Corrupted data** | Silent skip or crash | Dead Letter Queue (Redis `telemetry_errors`) | Zero data loss, full audit |
+| **System observability** | No metrics, just logs | Prometheus + Grafana with 14-panel dashboard | Real-time CPU, memory, latency, error rates |
 
 ---
 
@@ -670,8 +796,11 @@ await using var writer = await conn.BeginBinaryImportAsync(
 | Service | Port | Protocol | Description |
 |---------|------|----------|-------------|
 | Ingestion | `8085` | WebSocket | Sensor telemetry intake |
-| Processor | `5050` | HTTP/WS | SignalR hub endpoint |
+| Ingestion Metrics | `9100` | HTTP | Prometheus metrics endpoint |
+| Processor | `5050` | HTTP/WS | SignalR hub + Prometheus /metrics |
 | Dashboard | `3000` | HTTP | Nginx-served React app |
+| Prometheus | `9090` | HTTP | Metrics collection & PromQL |
+| Grafana | `3001` | HTTP | Health dashboards (admin/pulse2026) |
 | Redis | `6379` | RESP | Stream buffer |
 | TimescaleDB | `5432` | PostgreSQL | Persistent storage |
 
@@ -733,15 +862,17 @@ cd PulseEngine
 docker compose up --build
 ```
 
-All 6 services will start in dependency order:
+All 8 services will start in dependency order:
 
 ```
 1. Redis         → Healthy (PING/PONG)
 2. TimescaleDB   → Healthy (pg_isready) + runs init-db.sql
-3. Ingestor      → Connects to Redis, opens WebSocket on :8085
-4. Processor     → Connects to Redis + TimescaleDB, starts consumer, maps SignalR hub
+3. Ingestor      → Connects to Redis, opens WebSocket on :8085, metrics on :9100
+4. Processor     → Connects to Redis + TimescaleDB, SignalR hub + /metrics on :5050
 5. Dashboard     → Builds React app, Nginx serves on :3000 with /hub/ proxy
 6. Simulator     → Connects to Ingestor, begins generating sensor data
+7. Prometheus    → Scrapes Ingestor + Processor every 15s, UI on :9090
+8. Grafana       → Auto-provisions PulseEngine Health dashboard on :3001
 ```
 
 ### Access
@@ -749,14 +880,18 @@ All 6 services will start in dependency order:
 | Interface | URL |
 |-----------|-----|
 | Dashboard | [http://localhost:3000](http://localhost:3000) |
+| Grafana | [http://localhost:3001](http://localhost:3001) (admin / pulse2026) |
+| Prometheus | [http://localhost:9090](http://localhost:9090) |
 | WebSocket Ingestor | `ws://localhost:8085` |
 | SignalR Hub | `http://localhost:5050/hub/telemetry` |
+| Processor Metrics | `http://localhost:5050/metrics` |
+| Ingestor Metrics | `http://localhost:9100/metrics` |
 
 ### Clean Restart (clear all data)
 
 ```bash
 docker compose down
-docker volume rm pulseengine_redis_data pulseengine_pg_data
+docker volume rm pulseengine_redis_data pulseengine_pg_data pulseengine_prometheus_data pulseengine_grafana_data
 docker compose up --build
 ```
 

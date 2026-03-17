@@ -1,4 +1,5 @@
 import { WebSocketServer, WebSocket, RawData } from "ws";
+import { Gauge, Counter } from "prom-client";
 import { RedisStreamProducer, TelemetryEvent } from "../redis/producer";
 
 interface IncomingTelemetry {
@@ -9,6 +10,17 @@ interface IncomingTelemetry {
   timestamp?: string;
   metadata?: Record<string, unknown>;
 }
+
+// ── Prometheus Metrics ───────────────────────────────────
+const wsConnectionsActive = new Gauge({
+  name: "pulse_ws_connections_active",
+  help: "Number of active WebSocket sensor connections",
+});
+
+const wsMessagesReceivedTotal = new Counter({
+  name: "pulse_ws_messages_received_total",
+  help: "Total WebSocket messages received from sensors",
+});
 
 /**
  * TelemetryWebSocketServer — accepts concurrent sensor connections,
@@ -47,10 +59,12 @@ export class TelemetryWebSocketServer {
   private setupHandlers(): void {
     this.wss.on("connection", (ws: WebSocket) => {
       this.connectionCount++;
+      wsConnectionsActive.inc();
 
       if (this.connectionCount > this.maxConnections) {
         ws.close(1013, "Max connections exceeded");
         this.connectionCount--;
+        wsConnectionsActive.dec();
         return;
       }
 
@@ -58,6 +72,7 @@ export class TelemetryWebSocketServer {
 
       ws.on("close", () => {
         this.connectionCount--;
+        wsConnectionsActive.dec();
       });
 
       ws.on("error", (err) => {
@@ -71,6 +86,7 @@ export class TelemetryWebSocketServer {
   }
 
   private handleMessage(ws: WebSocket, raw: RawData): void {
+    wsMessagesReceivedTotal.inc();
     let payload: IncomingTelemetry;
 
     try {

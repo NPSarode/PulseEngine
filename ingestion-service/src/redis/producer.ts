@@ -1,4 +1,5 @@
 import Redis from "ioredis";
+import { Counter, Histogram } from "prom-client";
 
 /**
  * RedisStreamProducer — pushes validated telemetry events into a Redis Stream.
@@ -14,6 +15,18 @@ export interface TelemetryEvent {
   timestamp: string;        // ISO-8601 from sensor
   metadata?: string;        // JSON-stringified extra fields
 }
+
+// ── Prometheus Metrics ───────────────────────────────────
+const redisPushesTotal = new Counter({
+  name: "pulse_redis_pushes_total",
+  help: "Total events pushed to Redis Streams",
+});
+
+const batchFlushDuration = new Histogram({
+  name: "pulse_batch_flush_duration_seconds",
+  help: "Time to flush a micro-batch to Redis via pipeline",
+  buckets: [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25],
+});
 
 export class RedisStreamProducer {
   private client: Redis;
@@ -62,6 +75,7 @@ export class RedisStreamProducer {
       ...fields
     );
 
+    redisPushesTotal.inc();
     return id!;
   }
 
@@ -70,6 +84,7 @@ export class RedisStreamProducer {
    * Reduces round-trips — critical at 10k+ events/sec.
    */
   async pushBatch(events: TelemetryEvent[]): Promise<string[]> {
+    const end = batchFlushDuration.startTimer();
     const pipeline = this.client.pipeline();
 
     for (const event of events) {
@@ -96,6 +111,9 @@ export class RedisStreamProducer {
     }
 
     const results = await pipeline.exec();
+    end();
+    redisPushesTotal.inc(events.length);
+
     return (results ?? []).map(([err, id]) => {
       if (err) throw err;
       return id as string;
